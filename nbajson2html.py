@@ -331,8 +331,8 @@ function drawCourt(){{
   // Lower half (toward basket): dashed
   h+=A(-60,137.5,60,137.5,60,0,0,'stroke-dasharray="6,5"');
 
-  // ── Backboard ── (30 units each side = 6ft wide, at y=-7.5)
-  h+=L(-30,-7.5,30,-7.5);
+  // ── Backboard ── (30 units each side = 6ft wide, at y=-12.5)
+  h+=L(-30,-12.5,30,-12.5);
 
   // ── Basket ── (r=7.5, 9-inch radius rim)
   h+=C(0,0,7.5,"none",cL,2);
@@ -346,6 +346,8 @@ function drawCourt(){{
   // HOWEVER: with NBA→SVG y-flip, nbaY>0 maps to svgY<487.5 (upward on screen).
   // Going left→right (sx(-40) to sx(40)) CCW in SVG = top arc = bows toward smaller svgY = AWAY from hoop ✓
   h+=A(-40,0,40,0,40,0,1);
+  h+=L(-40,-12.5,-40,0);
+  h+=L(40,-12.5,40,0);
 
   // ── 3-point line ──
   // Corner straights: from baseline (y=-52.5) to y=89, at x=±220
