@@ -7,4 +7,5 @@ requires-python = ">=3.13"
 dependencies = [
     "nba-api==1.11.4",
     "pandas==3.0.3",
+    "pytest>=9.0.3",
 ]

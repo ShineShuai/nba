@@ -1,6 +1,7 @@
 import json
 import time
 import re
+import random
 import pandas as pd
 from datetime import date, datetime
 from nba_api.stats.endpoints import leaguegamefinder, shotchartdetail, boxscoretraditionalv3, boxscoresummaryv3
@@ -37,6 +38,42 @@ _HEADERS = {
 # default to 30, since longer timeout doesn't seem to help with reliability issues and may cause long hangs;
 # it likely dues to the NBA API's internal load and rate-limiting, so fail fast and retry if needed.
 _TIMEOUT = 30  # seconds
+
+# ---------------------------------------------------------------------------
+# Retry helper — wraps a callable, retries only on timeout, random backoff
+# ---------------------------------------------------------------------------
+_RETRY_COUNT = 3  # module-level default; overridden by --retry
+
+class _TimeoutError(Exception):
+    pass
+
+def _is_timeout(exc: Exception) -> bool:
+    """Return True if the exception looks like a network/read timeout."""
+    msg = str(exc).lower()
+    return any(k in msg for k in ("timeout", "timed out", "read timed out",
+                                   "connect timeout", "connectiontimeout"))
+
+def with_retry(fn, *args, label: str = "", retries: int = None, **kwargs):
+    """
+    Call fn(*args, **kwargs), retry up to `retries` times on timeout only.
+    Backoff: uniform random in [1, 2^attempt] seconds (capped at 60 s).
+    Non-timeout exceptions propagate immediately.
+    """
+    n = retries if retries is not None else _RETRY_COUNT
+    last_exc = None
+    for attempt in range(n + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if not _is_timeout(exc):
+                raise
+            last_exc = exc
+            if attempt < n:
+                wait = random.uniform(1, min(2 ** (attempt + 1), 60))
+                logging.warning(f"  Timeout on {label} (attempt {attempt+1}/{n+1}), "
+                                f"retry in {wait:.1f}s…")
+                time.sleep(wait)
+    raise last_exc
 
 
 def _build_team_maps():
@@ -228,7 +265,9 @@ def fetch_game(game_id, index, all_team_ids, season_str, season_type, game_date=
         shot_cnt = 0
         for team_id in team_ids:
             try:
-                sc = shotchartdetail.ShotChartDetail(
+                sc = with_retry(
+                    shotchartdetail.ShotChartDetail,
+                    label=f"ShotChart {game_id} {TEAM_ABBR_MAP.get(team_id, team_id)} {period_label}",
                     league_id='00',
                     team_id=team_id,
                     player_id=0,
@@ -274,7 +313,9 @@ def fetch_game(game_id, index, all_team_ids, season_str, season_type, game_date=
         while True:
             period_label = f"OT{period - 4}" if period > 4 else f"Q{period}"
             try:
-                box = boxscoretraditionalv3.BoxScoreTraditionalV3(
+                box = with_retry(
+                    boxscoretraditionalv3.BoxScoreTraditionalV3,
+                    label=f"BoxScore {game_id} {period_label}",
                     game_id=game_id,
                     start_period=period,
                     end_period=period,
@@ -386,11 +427,19 @@ def audit_game(game: dict):
     Return (missing_shot_periods, missing_box_periods) as sets of period labels,
     or _FULL_REFETCH_SENTINEL if the game has no data at all.
 
+    Gap detection covers:
+      - missing periods (original behaviour)
+      - missing teams within an existing period (a team present in other periods
+        but absent from a specific period's records)
+
     Uses BoxScoreSummaryV3 as ground truth for period count so partial fetches
     (crash after Q1, etc.) are correctly detected.
     """
-    shot_periods = {r["period"] for r in game.get("shot_plot_data", [])}
-    box_periods  = {r["period"] for r in game.get("box_score_metrics", [])}
+    shot_records = game.get("shot_plot_data", [])
+    box_records  = game.get("box_score_metrics", [])
+
+    shot_periods = {r["period"] for r in shot_records}
+    box_periods  = {r["period"] for r in box_records}
 
     if not shot_periods and not box_periods:
         return _FULL_REFETCH_SENTINEL
@@ -399,6 +448,26 @@ def audit_game(game: dict):
 
     missing_shot = expected - shot_periods
     missing_box  = expected - box_periods
+
+    # --- team-level gap detection ---
+    # Derive the full team set seen across all periods for each data source.
+    all_shot_teams = {r["team"] for r in shot_records}
+    all_box_teams  = {r["team"] for r in box_records}
+
+    # For each present period, check if any team is missing.
+    for period in (expected - missing_shot):  # periods already fetched for shots
+        teams_in_period = {r["team"] for r in shot_records if r["period"] == period}
+        if all_shot_teams - teams_in_period:
+            logging.info(f"  audit {game['game_id']} shot {period}: "
+                         f"missing teams {all_shot_teams - teams_in_period} — re-queuing")
+            missing_shot.add(period)
+
+    for period in (expected - missing_box):   # periods already fetched for box
+        teams_in_period = {r["team"] for r in box_records if r["period"] == period}
+        if all_box_teams - teams_in_period:
+            logging.info(f"  audit {game['game_id']} box {period}: "
+                         f"missing teams {all_box_teams - teams_in_period} — re-queuing")
+            missing_box.add(period)
 
     return missing_shot, missing_box
 
@@ -410,7 +479,9 @@ def fetch_shot_period(game_id: str, period: int, team_ids: list,
     shots = []
     for team_id in team_ids:
         try:
-            sc = shotchartdetail.ShotChartDetail(
+            sc = with_retry(
+                shotchartdetail.ShotChartDetail,
+                label=f"ShotChart {game_id} {TEAM_ABBR_MAP.get(team_id, team_id)} P{period}",
                 league_id='00',
                 team_id=team_id,
                 player_id=0,
@@ -446,7 +517,9 @@ def fetch_box_period(game_id: str, period: int) -> list:
     """Fetch box score for one period; return list of metric dicts."""
     metrics = []
     try:
-        box = boxscoretraditionalv3.BoxScoreTraditionalV3(
+        box = with_retry(
+            boxscoretraditionalv3.BoxScoreTraditionalV3,
+            label=f"BoxScore {game_id} P{period}",
             game_id=game_id,
             start_period=period,
             end_period=period,
@@ -618,7 +691,18 @@ def main():
     parser.add_argument("-c", "--continue",  dest="continue_mode", action="store_true",
                         help="Continue/patch mode: load existing -o JSON, fetch only missing\n"
                              "periods (shot plot or box score) and add any new games.")
+    parser.add_argument("--game-ids", nargs="+", metavar="GAME_ID",
+                        help="Explicit game IDs to fetch (e.g. 0042400215). Bypasses\n"
+                             "LeagueGameFinder; season type is derived from each game_id[2].\n"
+                             "Compatible with -c / --continue.")
+    parser.add_argument("--retry", type=int, default=3, metavar="N",
+                        help="Max retries per fetch on timeout (default: 3). Uses random\n"
+                             "exponential backoff: wait ~ uniform[1, 2^attempt] seconds.")
     args = parser.parse_args()
+
+    # Apply --retry globally
+    global _RETRY_COUNT
+    _RETRY_COUNT = args.retry
 
     # Validate teams
     teams = []
@@ -642,21 +726,32 @@ def main():
         if not re.match(r'^[12345]\d{4}$', args.season_id):
             parser.error(f"Invalid season_id '{args.season_id}'. Expected format: prefix(1-5) + 4-digit year, e.g. '42024'")
 
-    # Resolve game IDs
-    game_ids, season_type, season_str, teams, game_date_map = resolve_game_ids(
-        teams, args.num_games, from_date, args.season_id
-    )
+    # --game-ids: bypass LeagueGameFinder entirely
+    if args.game_ids:
+        game_ids     = args.game_ids
+        game_date_map = {}   # no date info from finder
+        # derive season_type from the first game_id; all should match in practice
+        season_type  = season_type_from_game_id(game_ids[0])
+        season_str   = current_season_str()
+        series_label = f"Explicit games: {', '.join(game_ids)}"
+        print(f"Using explicit game IDs: {game_ids}")
+    else:
+        # Resolve game IDs via LeagueGameFinder
+        game_ids, season_type, season_str, teams, game_date_map = resolve_game_ids(
+            teams, args.num_games, from_date, args.season_id
+        )
 
-    if not game_ids:
-        print("No games found. Exiting.")
-        return
+        if not game_ids:
+            print("No games found. Exiting.")
+            return
 
-    n_label = args.num_games if args.num_games is not None else len(game_ids)
-    series_label = build_series_label(teams, season_type, season_str, args.season_id, n_label)
+        n_label = args.num_games if args.num_games is not None else len(game_ids)
+        series_label = build_series_label(teams, season_type, season_str, args.season_id, n_label)
+
     print(f"Series label: {series_label}")
 
     # Determine team IDs for shot chart (empty → team_id=0 covers all)
-    all_team_ids = [TEAM_ID_MAP[t] for t in teams]
+    all_team_ids = [TEAM_ID_MAP[t] for t in teams] if teams else []
 
     if args.continue_mode:
         continue_fetch(
